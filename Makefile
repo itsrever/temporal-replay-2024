@@ -6,3 +6,4 @@ start:
 
 init:
 	temporal operator search-attribute create --name ReverStatus --type Keyword
+	go run ./cmd/main.go
