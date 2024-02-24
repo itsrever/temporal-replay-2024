@@ -28,5 +28,22 @@ func main() {
 }
 
 func Greet(ctx workflow.Context, name string) (string, error) {
+	attributes := map[string]interface{}{
+		"ReverStatus": "ON_HOLD",
+	}
+	// This won't persist search attributes on server because commands are not sent to server,
+	// but local cache will be updated.
+	err := workflow.UpsertSearchAttributes(ctx, attributes)
+	if err != nil {
+		return "", err
+	}
+
+	selector := workflow.NewSelector(ctx)
+	selector.AddReceive(workflow.GetSignalChannel(ctx, "retry"), func(c workflow.ReceiveChannel, more bool) {
+		c.Receive(ctx, nil)
+	})
+
+	selector.Select(ctx)
+
 	return "Hello, " + name, nil
 }

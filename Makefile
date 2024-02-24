@@ -2,8 +2,10 @@ install:
 	brew install temporal
 
 start:
-	temporal server start-dev
+	./start-temporal.sh
 
 init:
-	temporal operator search-attribute create --name ReverStatus --type Keyword
 	go run ./cmd/main.go
+
+run-wf:
+	temporal workflow start --task-queue greetings --type Greet --input '"Eric"'
