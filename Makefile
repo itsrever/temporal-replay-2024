@@ -10,7 +10,7 @@ start-temporal-cluster:
 start-worker:
 	go run ./cmd/main.go
 
-run-wf:
+run-workflow:
 	temporal workflow start --task-queue greetings --type Greet
 
 

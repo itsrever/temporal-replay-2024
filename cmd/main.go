@@ -11,7 +11,7 @@ import (
 	"go.temporal.io/sdk/workflow"
 )
 
-var ReverStatusSearchAttribute = temporal.NewSearchAttributeKeyKeyword("ReverStatus")
+var WorkflowStatusSearchAttribute = temporal.NewSearchAttributeKeyKeyword("WorkflowStatus")
 
 func main() {
 	c, err := client.Dial(client.Options{
@@ -46,18 +46,8 @@ func Greet(ctx workflow.Context, name string) error {
 	ctx = workflow.WithActivityOptions(ctx, ao)
 
 	TryThings(ctx, func() error {
-		// This needs to be idempotent
-		err := workflow.ExecuteActivity(ctx, FirstActivityReference).Get(ctx, nil)
-		if err != nil {
-			return err
-		}
-
-		return workflow.ExecuteActivity(ctx, SecondActivityReference).Get(ctx, nil)
+		return workflow.ExecuteActivity(ctx, (&Activities{}).GreetActivity).Get(ctx, nil)
 	})
-
-	// TryThings(ctx, func() error {
-	// 	return workflow.ExecuteActivity(ctx, SecondActivityReference).Get(ctx, nil)
-	// })
 
 	SetCompleted(ctx)
 
@@ -77,16 +67,16 @@ func TryThings(ctx workflow.Context, c func() error) {
 }
 
 func SetOnHold(ctx workflow.Context) {
-	_ = workflow.UpsertTypedSearchAttributes(ctx, ReverStatusSearchAttribute.ValueSet("ON_HOLD"))
+	_ = workflow.UpsertTypedSearchAttributes(ctx, WorkflowStatusSearchAttribute.ValueSet("ON_HOLD"))
 }
 
 func SetRunning(ctx workflow.Context) {
-	_ = workflow.UpsertTypedSearchAttributes(ctx, ReverStatusSearchAttribute.ValueSet("RUNNING"))
+	_ = workflow.UpsertTypedSearchAttributes(ctx, WorkflowStatusSearchAttribute.ValueSet("RUNNING"))
 
 }
 
 func SetCompleted(ctx workflow.Context) {
-	_ = workflow.UpsertTypedSearchAttributes(ctx, ReverStatusSearchAttribute.ValueSet("COMPLETED"))
+	_ = workflow.UpsertTypedSearchAttributes(ctx, WorkflowStatusSearchAttribute.ValueSet("COMPLETED"))
 }
 
 func OnActivityFailed(ctx workflow.Context) bool {
@@ -107,16 +97,9 @@ func OnActivityFailed(ctx workflow.Context) bool {
 	return isRetry
 }
 
-var FirstActivityReference = (&Activities{}).FirstActivity
-var SecondActivityReference = (&Activities{}).SecondActivity
-
 type Activities struct{}
 
-func (a *Activities) FirstActivity() error {
-	// return errors.New("failed to say greeting")
-	return nil
-}
-
-func (a *Activities) SecondActivity() error {
+func (a *Activities) GreetActivity() error {
 	return errors.New("failed to say greeting")
+	// return nil
 }
