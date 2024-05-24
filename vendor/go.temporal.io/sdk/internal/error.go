@@ -44,12 +44,12 @@ and actual error which caused activity failure. This internal error can be unwra
 Below are the possible types of internal error:
 1) *ApplicationError: (this should be the most common one)
 	*ApplicationError can be returned in two cases:
-		- If activity implementation returns *ApplicationError by using NewApplicationError() API.
-		  The err would contain a message, details, and NonRetryable flag. Workflow code could check this flag and details to determine
-		  what kind of error it was and take actions based on it. The details is encoded payload which workflow code could extract
-		  to strong typed variable. Workflow code needs to know what the types of the encoded details are before extracting them.
+		- If activity implementation returns *ApplicationError by using NewApplicationError()/NewNonRetryableApplicationError() API.
+		  The error would contain a message and optional details. Workflow code could extract details to string typed variable, determine
+		  what kind of error it was, and take actions based on it. The details are encoded payload therefore, workflow code needs to know what
+          the types of the encoded details are before extracting them.
 		- If activity implementation returns errors other than from NewApplicationError() API. In this case GetOriginalType()
-		  will return original type of an error represented as string. Workflow code could check this type to determine what kind of error it was
+		  will return original type of error represented as string. Workflow code could check this type to determine what kind of error it was
 		  and take actions based on the type. These errors are retryable by default, unless error type is specified in retry policy.
 2) *CanceledError:
 	If activity was canceled, internal error will be an instance of *CanceledError. When activity cancels itself by
@@ -59,19 +59,18 @@ Below are the possible types of internal error:
 	details about what type of timeout it was.
 4) *PanicError:
 	If activity code panic while executing, temporal activity worker will report it as activity failure to temporal server.
-	The SDK will present that failure as *PanicError. The err contains a string	representation of the panic message and
+	The SDK will present that failure as *PanicError. The error contains a string	representation of the panic message and
 	the call stack when panic was happen.
-
 Workflow code could handle errors based on different types of error. Below is sample code of how error handling looks like.
 
 err := workflow.ExecuteActivity(ctx, MyActivity, ...).Get(ctx, nil)
 if err != nil {
 	var applicationErr *ApplicationError
 	if errors.As(err, &applicationError) {
+		// retrieve error message
+		fmt.Println(applicationError.Error())
+
 		// handle activity errors (created via NewApplicationError() API)
-		if !applicationErr.NonRetryable() {
-			// manually retry activity
-		}
 		var detailMsg string // assuming activity return error by NewApplicationError("message", true, "string details")
 		applicationErr.Details(&detailMsg) // extract strong typed details
 
@@ -95,12 +94,12 @@ if err != nil {
 	if errors.As(err, &timeoutErr) {
 		// handle timeout, could check timeout type by timeoutErr.TimeoutType()
         switch err.TimeoutType() {
-        case commonpb.ScheduleToStart:
-                // Handle ScheduleToStart timeout.
-        case commonpb.StartToClose:
-                // Handle StartToClose timeout.
-        case commonpb.Heartbeat:
-                // Handle heartbeat timeout.
+        case enumspb.TIMEOUT_TYPE_SCHEDULE_TO_START:
+			// Handle ScheduleToStart timeout.
+        case enumspb.TIMEOUT_TYPE_START_TO_CLOSE:
+            // Handle StartToClose timeout.
+        case enumspb.TIMEOUT_TYPE_HEARTBEAT:
+            // Handle heartbeat timeout.
         default:
         }
 	}
@@ -110,24 +109,41 @@ if err != nil {
 		// handle panic, message and stack trace are available by panicErr.Error() and panicErr.StackTrace()
 	}
 }
-
 Errors from child workflow should be handled in a similar way, except that instance of *ChildWorkflowExecutionError is returned to
-workflow code. It will contains *ActivityError, which in turn will contains on of the errors above.
+workflow code. It might contain *ActivityError in case if error comes from activity (which in turn will contain on of the errors above),
+or *ApplicationError in case if error comes from child workflow itself.
+
 When panic happen in workflow implementation code, SDK catches that panic and causing the workflow task timeout.
 That workflow task will be retried at a later time (with exponential backoff retry intervals).
-
-Workflow consumers will get an instance of *WorkflowExecutionError. This error will contains one of errors above.
+Workflow consumers will get an instance of *WorkflowExecutionError. This error will contain one of errors above.
 */
 
 type (
+	// ApplicationErrorOptions represents a combination of error attributes and additional requests.
+	// All fields are optional, providing flexibility in error customization.
+	ApplicationErrorOptions struct {
+		NonRetryable bool
+		Cause        error
+		Details      []interface{}
+		// NextRetryInterval is a request from server to override retry interval calculated by the
+		// server according to the RetryPolicy set by the Workflow.
+		// IMPORTANT: NextRetryInterval is meaningful only within the context of errors originating from Activity.
+		// Any value set from Workflow or LocalActivity will be silently ignored.
+		// It is impossible to specify immediate retry as it is indistinguishable from the default value. As a
+		// workaround you could set NextRetryDelay to some small value.
+		// NOTE: This is not currently supported by the Temporal Server as of 1.23.0.
+		NextRetryDelay time.Duration
+	}
+
 	// ApplicationError returned from activity implementations with message and optional details.
 	ApplicationError struct {
 		temporalError
-		msg          string
-		errType      string
-		nonRetryable bool
-		cause        error
-		details      converter.EncodedValues
+		msg            string
+		errType        string
+		nonRetryable   bool
+		cause          error
+		details        converter.EncodedValues
+		nextRetryDelay time.Duration
 	}
 
 	// TimeoutError returned when activity or child workflow timed out.
@@ -181,6 +197,24 @@ type (
 		// VersioningIntent specifies whether the continued workflow should run on a worker with a
 		// compatible build ID or not. See VersioningIntent.
 		VersioningIntent VersioningIntent
+
+		// This is by default nil but may be overridden using NewContinueAsNewErrorWithOptions.
+		// It specifies the retry policy which gets carried over to the next run.
+		// If not set, the current workflow's retry policy will be carried over automatically.
+		//
+		// NOTES:
+		// 1. This is always nil when returned from a client as a workflow response.
+		// 2. Unlike other options that can be overridden using WithWorkflowTaskQueue, WithWorkflowRunTimeout, etc.
+		//    we can't introduce an option, say WithWorkflowRetryPolicy, for backward compatibility.
+		//    See #676 or IntegrationTestSuite::TestContinueAsNewWithWithChildWF for more details.
+		RetryPolicy *RetryPolicy
+	}
+
+	// ContinueAsNewErrorOptions specifies optional attributes to be carried over to the next run.
+	ContinueAsNewErrorOptions struct {
+		// RetryPolicy specifies the retry policy to be used for the next run.
+		// If nil, the current workflow's retry policy will be used.
+		RetryPolicy *RetryPolicy
 	}
 
 	// UnknownExternalWorkflowExecutionError can be returned when external workflow doesn't exist
@@ -285,13 +319,22 @@ var (
 
 // NewApplicationError create new instance of *ApplicationError with message, type, and optional details.
 func NewApplicationError(msg string, errType string, nonRetryable bool, cause error, details ...interface{}) error {
+	return NewApplicationErrorWithOptions(
+		msg,
+		errType,
+		ApplicationErrorOptions{NonRetryable: nonRetryable, Cause: cause, Details: details},
+	)
+}
+
+func NewApplicationErrorWithOptions(msg string, errType string, options ApplicationErrorOptions) error {
 	applicationErr := &ApplicationError{
 		msg:          msg,
 		errType:      errType,
-		nonRetryable: nonRetryable,
-		cause:        cause}
-
+		cause:        options.Cause,
+		nonRetryable: options.NonRetryable,
+	}
 	// When return error to user, use EncodedValues as details and data is ready to be decoded by calling Get
+	details := options.Details
 	if len(details) == 1 {
 		if d, ok := details[0].(*EncodedValues); ok {
 			applicationErr.details = d
@@ -435,6 +478,20 @@ func NewContinueAsNewError(ctx Context, wfn interface{}, args ...interface{}) er
 	return i.NewContinueAsNewError(ctx, wfn, args...)
 }
 
+// NewContinueAsNewErrorWithOptions creates ContinueAsNewError instance with additional options.
+func NewContinueAsNewErrorWithOptions(ctx Context, options ContinueAsNewErrorOptions, wfn interface{}, args ...interface{}) error {
+	err := NewContinueAsNewError(ctx, wfn, args...)
+
+	var continueAsNewErr *ContinueAsNewError
+	if errors.As(err, &continueAsNewErr) {
+		if options.RetryPolicy != nil {
+			continueAsNewErr.RetryPolicy = options.RetryPolicy
+		}
+	}
+
+	return err
+}
+
 func (wc *workflowEnvironmentInterceptor) NewContinueAsNewError(
 	ctx Context,
 	wfn interface{},
@@ -465,6 +522,7 @@ func (wc *workflowEnvironmentInterceptor) NewContinueAsNewError(
 		WorkflowRunTimeout:       options.WorkflowRunTimeout,
 		WorkflowTaskTimeout:      options.WorkflowTaskTimeout,
 		VersioningIntent:         options.VersioningIntent,
+		RetryPolicy:              nil, // The retry policy can't be propagated like other options due to #676.
 	}
 }
 
@@ -524,9 +582,11 @@ func (e *ApplicationError) Unwrap() error {
 	return e.cause
 }
 
+func (e *ApplicationError) NextRetryDelay() time.Duration { return e.nextRetryDelay }
+
 // Error from error interface
 func (e *TimeoutError) Error() string {
-	msg := fmt.Sprintf("%s (type: %v)", e.message(), e.timeoutType)
+	msg := fmt.Sprintf("%s (type: %s)", e.message(), e.timeoutType)
 	if e.cause != nil {
 		msg = fmt.Sprintf("%s: %v", msg, e.cause)
 	}

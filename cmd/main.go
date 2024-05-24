@@ -11,12 +11,14 @@ import (
 	"go.temporal.io/sdk/workflow"
 )
 
+var ReverStatusSearchAttribute = temporal.NewSearchAttributeKeyKeyword("ReverStatus")
+
 func main() {
 	c, err := client.Dial(client.Options{
 		HostPort: client.DefaultHostPort,
 	})
 	if err != nil {
-		log.Fatalln("Unable to create client", err)
+		log.Fatalln("Unable to create temporal client", err)
 	}
 	defer c.Close()
 
@@ -75,24 +77,16 @@ func TryThings(ctx workflow.Context, c func() error) {
 }
 
 func SetOnHold(ctx workflow.Context) {
-	attributes := map[string]interface{}{
-		"ReverStatus": "ON_HOLD",
-	}
-	_ = workflow.UpsertSearchAttributes(ctx, attributes)
+	_ = workflow.UpsertTypedSearchAttributes(ctx, ReverStatusSearchAttribute.ValueSet("ON_HOLD"))
 }
 
 func SetRunning(ctx workflow.Context) {
-	attributes := map[string]interface{}{
-		"ReverStatus": "RUNNING",
-	}
-	_ = workflow.UpsertSearchAttributes(ctx, attributes)
+	_ = workflow.UpsertTypedSearchAttributes(ctx, ReverStatusSearchAttribute.ValueSet("RUNNING"))
+
 }
 
 func SetCompleted(ctx workflow.Context) {
-	attributes := map[string]interface{}{
-		"ReverStatus": "COMPLETED",
-	}
-	_ = workflow.UpsertSearchAttributes(ctx, attributes)
+	_ = workflow.UpsertTypedSearchAttributes(ctx, ReverStatusSearchAttribute.ValueSet("COMPLETED"))
 }
 
 func OnActivityFailed(ctx workflow.Context) bool {

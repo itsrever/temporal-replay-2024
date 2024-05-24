@@ -31,6 +31,11 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/exp/constraints"
+	"golang.org/x/exp/slices"
+
+	"google.golang.org/protobuf/types/known/durationpb"
+
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
 	failurepb "go.temporal.io/api/failure/v1"
@@ -292,8 +297,20 @@ type (
 		// Use GetSearchAttributes API to get valid key and corresponding value type.
 		// For supported operations on different server versions see [Visibility].
 		//
+		// Deprecated: Use TypedSearchAttributes instead.
+		//
 		// [Visibility]: https://docs.temporal.io/visibility
 		SearchAttributes map[string]interface{}
+
+		// TypedSearchAttributes - Specifies Search Attributes that will be attached to the Workflow. Search Attributes are
+		// additional indexed information attributed to workflow and used for search and visibility. The search attributes
+		// can be used in query of List/Scan/Count workflow APIs. The key and its value type must be registered on Temporal
+		// server side. For supported operations on different server versions see [Visibility].
+		//
+		// Optional: default to none.
+		//
+		// [Visibility]: https://docs.temporal.io/visibility
+		TypedSearchAttributes SearchAttributes
 
 		// ParentClosePolicy - Optional policy to decide what to do for the child.
 		// Default is Terminate (if onboarded to this feature)
@@ -919,6 +936,7 @@ func (wc *workflowEnvironmentInterceptor) ExecuteChildWorkflow(ctx Context, chil
 	options.ContextPropagators = workflowOptionsFromCtx.ContextPropagators
 	options.Memo = workflowOptionsFromCtx.Memo
 	options.SearchAttributes = workflowOptionsFromCtx.SearchAttributes
+	options.TypedSearchAttributes = workflowOptionsFromCtx.TypedSearchAttributes
 	options.VersioningIntent = workflowOptionsFromCtx.VersioningIntent
 
 	header, err := workflowHeaderPropagated(ctx, options.ContextPropagators)
@@ -995,14 +1013,19 @@ type WorkflowInfo struct {
 	ContinuedExecutionRunID string
 	ParentWorkflowNamespace string
 	ParentWorkflowExecution *WorkflowExecution
-	Memo                    *commonpb.Memo             // Value can be decoded using data converter (defaultDataConverter, or custom one if set).
-	SearchAttributes        *commonpb.SearchAttributes // Value can be decoded using defaultDataConverter.
-	RetryPolicy             *RetryPolicy
+	Memo                    *commonpb.Memo // Value can be decoded using data converter (defaultDataConverter, or custom one if set).
+	// Deprecated: use [Workflow.GetTypedSearchAttributes] instead.
+	SearchAttributes *commonpb.SearchAttributes // Value can be decoded using defaultDataConverter.
+	RetryPolicy      *RetryPolicy
 	// BinaryChecksum represents the value persisted by the last worker to complete a task in this workflow. It may be
 	// an explicitly set or implicitly derived binary checksum of the worker binary, or, if this worker has opted into
 	// build-id based versioning, is the explicitly set worker build id. If this is the first worker to operate on the
 	// workflow, it is this worker's current value.
 	BinaryChecksum string
+	// currentTaskBuildID, if nonempty, contains the Build ID of the worker that processed the task
+	// which is currently or about to be executing. If no longer replaying will be set to the ID of
+	// this worker
+	currentTaskBuildID string
 
 	continueAsNewSuggested bool
 	currentHistorySize     int
@@ -1014,12 +1037,22 @@ type UpdateInfo struct {
 	ID string
 }
 
-// GetBinaryChecksum return binary checksum.
+// GetBinaryChecksum returns the binary checksum of the last worker to complete a task for this
+// workflow, or if this is the first task, this worker's checksum.
 func (wInfo *WorkflowInfo) GetBinaryChecksum() string {
 	if wInfo.BinaryChecksum == "" {
 		return getBinaryChecksum()
 	}
 	return wInfo.BinaryChecksum
+}
+
+// GetCurrentBuildID returns the Build ID of the worker that processed this task, which may be
+// empty. During replay this id may not equal the id of the replaying worker. If not replaying and
+// this worker has a defined Build ID, it will equal that ID. It is safe to use for branching.
+// When used inside a query, the ID of the worker that processed the task which last affected
+// the workflow will be returned.
+func (wInfo *WorkflowInfo) GetCurrentBuildID() string {
+	return wInfo.currentTaskBuildID
 }
 
 // GetCurrentHistoryLength returns the current length of history when called.
@@ -1049,6 +1082,15 @@ func GetWorkflowInfo(ctx Context) *WorkflowInfo {
 
 func (wc *workflowEnvironmentInterceptor) GetInfo(ctx Context) *WorkflowInfo {
 	return wc.env.WorkflowInfo()
+}
+
+func GetTypedSearchAttributes(ctx Context) SearchAttributes {
+	i := getWorkflowOutboundInterceptor(ctx)
+	return i.GetTypedSearchAttributes(ctx)
+}
+
+func (wc *workflowEnvironmentInterceptor) GetTypedSearchAttributes(ctx Context) SearchAttributes {
+	return wc.env.TypedSearchAttributes()
 }
 
 // GetUpdateInfo extracts info of a currently running update from a context.
@@ -1272,7 +1314,6 @@ func signalExternalWorkflow(ctx Context, workflowID, runID, signalName string, a
 // UpsertSearchAttributes is used to add or update workflow search attributes.
 // The search attributes can be used in query of List/Scan/Count workflow APIs.
 // The key and value type must be registered on temporal server side;
-// The value has to deterministic when replay;
 // The value has to be Json serializable.
 // UpsertSearchAttributes will merge attributes to existing map in workflow, for example workflow code:
 //
@@ -1300,6 +1341,8 @@ func signalExternalWorkflow(ctx Context, workflowID, runID, signalName string, a
 //
 // For supported operations on different server versions see [Visibility].
 //
+// Deprecated: Use [UpsertTypedSearchAttributes] instead.
+//
 // [Visibility]: https://docs.temporal.io/visibility
 func UpsertSearchAttributes(ctx Context, attributes map[string]interface{}) error {
 	assertNotInReadOnlyState(ctx)
@@ -1312,6 +1355,22 @@ func (wc *workflowEnvironmentInterceptor) UpsertSearchAttributes(ctx Context, at
 		return errors.New("TemporalChangeVersion is a reserved key that cannot be set, please use other key")
 	}
 	return wc.env.UpsertSearchAttributes(attributes)
+}
+
+func UpsertTypedSearchAttributes(ctx Context, attributes ...SearchAttributeUpdate) error {
+	assertNotInReadOnlyState(ctx)
+	i := getWorkflowOutboundInterceptor(ctx)
+	return i.UpsertTypedSearchAttributes(ctx, attributes...)
+}
+
+func (wc *workflowEnvironmentInterceptor) UpsertTypedSearchAttributes(ctx Context, attributes ...SearchAttributeUpdate) error {
+	sa := SearchAttributes{
+		untypedValue: make(map[SearchAttributeKey]interface{}),
+	}
+	for _, attribute := range attributes {
+		attribute(&sa)
+	}
+	return wc.env.UpsertTypedSearchAttributes(sa)
 }
 
 // UpsertMemo is used to add or update workflow memo.
@@ -1372,6 +1431,7 @@ func WithChildWorkflowOptions(ctx Context, cwo ChildWorkflowOptions) Context {
 	wfOptions.CronSchedule = cwo.CronSchedule
 	wfOptions.Memo = cwo.Memo
 	wfOptions.SearchAttributes = cwo.SearchAttributes
+	wfOptions.TypedSearchAttributes = cwo.TypedSearchAttributes
 	wfOptions.ParentClosePolicy = cwo.ParentClosePolicy
 	wfOptions.VersioningIntent = cwo.VersioningIntent
 
@@ -1397,6 +1457,7 @@ func GetChildWorkflowOptions(ctx Context) ChildWorkflowOptions {
 		CronSchedule:             opts.CronSchedule,
 		Memo:                     opts.Memo,
 		SearchAttributes:         opts.SearchAttributes,
+		TypedSearchAttributes:    opts.TypedSearchAttributes,
 		ParentClosePolicy:        opts.ParentClosePolicy,
 		VersioningIntent:         opts.VersioningIntent,
 	}
@@ -1423,6 +1484,13 @@ func WithWorkflowTaskQueue(ctx Context, name string) Context {
 func WithWorkflowID(ctx Context, workflowID string) Context {
 	ctx1 := setWorkflowEnvOptionsIfNotExist(ctx)
 	getWorkflowEnvOptions(ctx1).WorkflowID = workflowID
+	return ctx1
+}
+
+// WithTypedSearchAttributes add these search attribute to the context
+func WithTypedSearchAttributes(ctx Context, searchAttributes SearchAttributes) Context {
+	ctx1 := setWorkflowEnvOptionsIfNotExist(ctx)
+	getWorkflowEnvOptions(ctx1).TypedSearchAttributes = searchAttributes
 	return ctx1
 }
 
@@ -1742,7 +1810,7 @@ func SetQueryHandler(ctx Context, queryType string, handler interface{}) error {
 // the update handler itself is invoked and if this function returns an error,
 // the update request will be considered to have been rejected and as such will
 // not occupy any space in the workflow history. Validation functions must take
-// as inputs the same parameters as the associated update handler but my vary
+// as inputs the same parameters as the associated update handler but may vary
 // from said handler by the presence/absence of a workflow.Context as the first
 // parameter. Validation handlers must only return a single error. Validation
 // handlers must be deterministic and can observe workflow state but must not
@@ -1998,8 +2066,8 @@ func convertToPBRetryPolicy(retryPolicy *RetryPolicy) *commonpb.RetryPolicy {
 	}
 
 	return &commonpb.RetryPolicy{
-		MaximumInterval:        &retryPolicy.MaximumInterval,
-		InitialInterval:        &retryPolicy.InitialInterval,
+		MaximumInterval:        durationpb.New(retryPolicy.MaximumInterval),
+		InitialInterval:        durationpb.New(retryPolicy.InitialInterval),
 		BackoffCoefficient:     retryPolicy.BackoffCoefficient,
 		MaximumAttempts:        retryPolicy.MaximumAttempts,
 		NonRetryableErrorTypes: retryPolicy.NonRetryableErrorTypes,
@@ -2017,13 +2085,8 @@ func convertFromPBRetryPolicy(retryPolicy *commonpb.RetryPolicy) *RetryPolicy {
 		NonRetryableErrorTypes: retryPolicy.NonRetryableErrorTypes,
 	}
 
-	// Avoid nil pointer dereferences
-	if v := retryPolicy.MaximumInterval; v != nil {
-		p.MaximumInterval = *v
-	}
-	if v := retryPolicy.InitialInterval; v != nil {
-		p.InitialInterval = *v
-	}
+	p.MaximumInterval = retryPolicy.MaximumInterval.AsDuration()
+	p.InitialInterval = retryPolicy.InitialInterval.AsDuration()
 
 	return &p
 }
@@ -2031,4 +2094,28 @@ func convertFromPBRetryPolicy(retryPolicy *commonpb.RetryPolicy) *RetryPolicy {
 // GetLastCompletionResultFromWorkflowInfo returns value of last completion result.
 func GetLastCompletionResultFromWorkflowInfo(info *WorkflowInfo) *commonpb.Payloads {
 	return info.lastCompletionResult
+}
+
+// DeterministicKeys returns the keys of a map in deterministic (sorted) order. To be used in for
+// loops in workflows for deterministic iteration.
+func DeterministicKeys[K constraints.Ordered, V any](m map[K]V) []K {
+	r := make([]K, 0, len(m))
+	for k := range m {
+		r = append(r, k)
+	}
+	slices.Sort(r)
+	return r
+}
+
+// DeterministicKeysFunc returns the keys of a map in a deterministic (sorted) order.
+// cmp(a, b) should return a negative number when a < b, a positive number when
+// a > b and zero when a == b. Keys are sorted by cmp.
+// To be used in for loops in workflows for deterministic iteration.
+func DeterministicKeysFunc[K comparable, V any](m map[K]V, cmp func(a K, b K) int) []K {
+	r := make([]K, 0, len(m))
+	for k := range m {
+		r = append(r, k)
+	}
+	slices.SortStableFunc(r, cmp)
+	return r
 }

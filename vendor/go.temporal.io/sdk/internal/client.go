@@ -35,8 +35,8 @@ import (
 	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/operatorservice/v1"
 	"go.temporal.io/api/workflowservice/v1"
-	uberatomic "go.uber.org/atomic"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 
 	"go.temporal.io/sdk/converter"
 	"go.temporal.io/sdk/internal/common/metrics"
@@ -422,6 +422,9 @@ type (
 		// default: default
 		Namespace string
 
+		// Optional: Set the credentials for this client.
+		Credentials Credentials
+
 		// Optional: Logger framework can use to log.
 		// default: default logger provided.
 		Logger log.Logger
@@ -474,7 +477,6 @@ type (
 	HeadersProvider interface {
 		GetHeaders(ctx context.Context) (map[string]string, error)
 	}
-
 	// TrafficController is getting called in the interceptor chain with API invocation parameters.
 	// Result is either nil if API call is allowed or an error, in which case request would be interrupted and
 	// the error will be propagated back through the interceptor chain.
@@ -491,23 +493,30 @@ type (
 		// This value only used when TLS is nil.
 		Authority string
 
-		// Enables keep alive ping from client to the server, which can help detect abruptly closed connections faster.
-		EnableKeepAliveCheck bool
+		// Disable keep alive ping from client to the server.
+		DisableKeepAliveCheck bool
 
 		// After a duration of this time if the client doesn't see any activity it
 		// pings the server to see if the transport is still alive.
 		// If set below 10s, a minimum value of 10s will be used instead.
+		// default: 30s
 		KeepAliveTime time.Duration
 
 		// After having pinged for keepalive check, the client waits for a duration
 		// of Timeout and if no activity is seen even after that the connection is
 		// closed.
+		// default: 15s
 		KeepAliveTimeout time.Duration
 
-		// If true, client sends keepalive pings even with no active RPCs. If false,
-		// when there are no active RPCs, Time and Timeout will be ignored and no
+		// GetSystemInfoTimeout is the timeout for the RPC made by the
+		// client to fetch server capabilities.
+		GetSystemInfoTimeout time.Duration
+
+		// if true, when there are no active RPCs, Time and Timeout will be ignored and no
 		// keepalive pings will be sent.
-		KeepAlivePermitWithoutStream bool
+		// If false, client sends keepalive pings even with no active RPCs
+		// default: false
+		DisableKeepAlivePermitWithoutStream bool
 
 		// MaxPayloadSize is a number of bytes that gRPC would allow to travel to and from server. Defaults to 128 MB.
 		MaxPayloadSize int
@@ -529,7 +538,7 @@ type (
 		// other gRPC errors. If not present during service client creation, it will
 		// be created as false. This is set to true when server capabilities are
 		// fetched.
-		excludeInternalFromRetry *uberatomic.Bool
+		excludeInternalFromRetry *atomic.Bool
 	}
 
 	// StartWorkflowOptions configuration parameters for starting a workflow execution.
@@ -604,8 +613,20 @@ type (
 		// Use GetSearchAttributes API to get valid key and corresponding value type.
 		// For supported operations on different server versions see [Visibility].
 		//
+		// Deprecated: use TypedSearchAttributes instead.
+		//
 		// [Visibility]: https://docs.temporal.io/visibility
 		SearchAttributes map[string]interface{}
+
+		// TypedSearchAttributes - Specifies Search Attributes that will be attached to the Workflow. Search Attributes are
+		// additional indexed information attributed to workflow and used for search and visibility. The search attributes
+		// can be used in query of List/Scan/Count workflow APIs. The key and its value type must be registered on Temporal
+		// server side. For supported operations on different server versions see [Visibility].
+		//
+		// Optional: default to none.
+		//
+		// [Visibility]: https://docs.temporal.io/visibility
+		TypedSearchAttributes SearchAttributes
 
 		// EnableEagerStart - request eager execution for this workflow, if a local worker is available.
 		//
@@ -619,8 +640,6 @@ type (
 		// If the workflow gets a signal before the delay, a workflow task will be dispatched and the rest
 		// of the delay will be ignored. A signal from signal with start will not trigger a workflow task.
 		// Cannot be set the same time as a CronSchedule.
-		//
-		// NOTE: Experimental
 		StartDelay time.Duration
 	}
 
@@ -690,36 +709,43 @@ type (
 	}
 )
 
+// Credentials are optional credentials that can be specified in ClientOptions.
+type Credentials interface {
+	applyToOptions(*ClientOptions) error
+	// Can return nil to have no interceptor
+	gRPCInterceptor() grpc.UnaryClientInterceptor
+}
+
 // DialClient creates a client and attempts to connect to the server.
-func DialClient(options ClientOptions) (Client, error) {
+func DialClient(ctx context.Context, options ClientOptions) (Client, error) {
 	options.ConnectionOptions.disableEagerConnection = false
-	return NewClient(options)
+	return NewClient(ctx, options)
 }
 
 // NewLazyClient creates a client and does not attempt to connect to the server.
 func NewLazyClient(options ClientOptions) (Client, error) {
 	options.ConnectionOptions.disableEagerConnection = true
-	return NewClient(options)
+	return NewClient(context.Background(), options)
 }
 
 // NewClient creates an instance of a workflow client
 //
 // Deprecated: Use DialClient or NewLazyClient instead.
-func NewClient(options ClientOptions) (Client, error) {
-	return newClient(options, nil)
+func NewClient(ctx context.Context, options ClientOptions) (Client, error) {
+	return newClient(ctx, options, nil)
 }
 
 // NewClientFromExisting creates a new client using the same connection as the
 // existing client.
-func NewClientFromExisting(existingClient Client, options ClientOptions) (Client, error) {
+func NewClientFromExisting(ctx context.Context, existingClient Client, options ClientOptions) (Client, error) {
 	existing, _ := existingClient.(*WorkflowClient)
 	if existing == nil {
 		return nil, fmt.Errorf("existing client must have been created directly from a client package call")
 	}
-	return newClient(options, existing)
+	return newClient(ctx, options, existing)
 }
 
-func newClient(options ClientOptions, existing *WorkflowClient) (Client, error) {
+func newClient(ctx context.Context, options ClientOptions, existing *WorkflowClient) (Client, error) {
 	if options.Namespace == "" {
 		options.Namespace = DefaultNamespace
 	}
@@ -739,11 +765,17 @@ func newClient(options ClientOptions, existing *WorkflowClient) (Client, error) 
 		options.Logger.Info("No logger configured for temporal client. Created default one.")
 	}
 
+	if options.Credentials != nil {
+		if err := options.Credentials.applyToOptions(&options); err != nil {
+			return nil, err
+		}
+	}
+
 	// Dial or use existing connection
 	var connection *grpc.ClientConn
 	var err error
 	if existing == nil {
-		options.ConnectionOptions.excludeInternalFromRetry = uberatomic.NewBool(false)
+		options.ConnectionOptions.excludeInternalFromRetry = &atomic.Bool{}
 		connection, err = dial(newDialParameters(&options, options.ConnectionOptions.excludeInternalFromRetry))
 		if err != nil {
 			return nil, err
@@ -758,13 +790,13 @@ func newClient(options ClientOptions, existing *WorkflowClient) (Client, error) 
 	// the new connection. Otherwise, only load server capabilities eagerly if not
 	// disabled.
 	if existing != nil {
-		if client.capabilities, err = existing.loadCapabilities(); err != nil {
+		if client.capabilities, err = existing.loadCapabilities(ctx, options.ConnectionOptions.GetSystemInfoTimeout); err != nil {
 			return nil, err
 		}
 		client.unclosedClients = existing.unclosedClients
 	} else {
 		if !options.ConnectionOptions.disableEagerConnection {
-			if _, err := client.loadCapabilities(); err != nil {
+			if _, err := client.loadCapabilities(ctx, options.ConnectionOptions.GetSystemInfoTimeout); err != nil {
 				client.Close()
 				return nil, err
 			}
@@ -777,7 +809,7 @@ func newClient(options ClientOptions, existing *WorkflowClient) (Client, error) 
 	return client, nil
 }
 
-func newDialParameters(options *ClientOptions, excludeInternalFromRetry *uberatomic.Bool) dialParameters {
+func newDialParameters(options *ClientOptions, excludeInternalFromRetry *atomic.Bool) dialParameters {
 	return dialParameters{
 		UserConnectionOptions: options.ConnectionOptions,
 		HostPort:              options.HostPort,
@@ -786,6 +818,7 @@ func newDialParameters(options *ClientOptions, excludeInternalFromRetry *uberato
 			options.HeadersProvider,
 			options.TrafficController,
 			excludeInternalFromRetry,
+			options.Credentials,
 		),
 		DefaultServiceConfig: defaultServiceConfig,
 	}
@@ -815,7 +848,7 @@ func NewServiceClient(workflowServiceClient workflowservice.WorkflowServiceClien
 	}
 
 	if options.ConnectionOptions.excludeInternalFromRetry == nil {
-		options.ConnectionOptions.excludeInternalFromRetry = uberatomic.NewBool(false)
+		options.ConnectionOptions.excludeInternalFromRetry = &atomic.Bool{}
 	}
 
 	// Collect set of applicable worker interceptors
@@ -909,3 +942,53 @@ func NewValue(data *commonpb.Payloads) converter.EncodedValue {
 func NewValues(data *commonpb.Payloads) converter.EncodedValues {
 	return newEncodedValues(data, nil)
 }
+
+type apiKeyCredentials func(context.Context) (string, error)
+
+func NewAPIKeyStaticCredentials(apiKey string) Credentials {
+	return NewAPIKeyDynamicCredentials(func(ctx context.Context) (string, error) { return apiKey, nil })
+}
+
+func NewAPIKeyDynamicCredentials(apiKeyCallback func(context.Context) (string, error)) Credentials {
+	return apiKeyCredentials(apiKeyCallback)
+}
+
+func (apiKeyCredentials) applyToOptions(*ClientOptions) error { return nil }
+
+func (a apiKeyCredentials) gRPCInterceptor() grpc.UnaryClientInterceptor { return a.gRPCIntercept }
+
+func (a apiKeyCredentials) gRPCIntercept(
+	ctx context.Context,
+	method string,
+	req any,
+	reply any,
+	cc *grpc.ClientConn,
+	invoker grpc.UnaryInvoker,
+	opts ...grpc.CallOption,
+) error {
+	if apiKey, err := a(ctx); err != nil {
+		return err
+	} else if apiKey != "" {
+		// Only add API key if it doesn't already exist
+		if md, _ := metadata.FromOutgoingContext(ctx); len(md.Get("authorization")) == 0 {
+			ctx = metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+apiKey)
+		}
+	}
+	return invoker(ctx, method, req, reply, cc, opts...)
+}
+
+type mTLSCredentials tls.Certificate
+
+func NewMTLSCredentials(certificate tls.Certificate) Credentials { return mTLSCredentials(certificate) }
+
+func (m mTLSCredentials) applyToOptions(opts *ClientOptions) error {
+	if opts.ConnectionOptions.TLS == nil {
+		opts.ConnectionOptions.TLS = &tls.Config{}
+	} else if len(opts.ConnectionOptions.TLS.Certificates) != 0 {
+		return fmt.Errorf("cannot apply mTLS credentials, certificates already exist on TLS options")
+	}
+	opts.ConnectionOptions.TLS.Certificates = append(opts.ConnectionOptions.TLS.Certificates, tls.Certificate(m))
+	return nil
+}
+
+func (mTLSCredentials) gRPCInterceptor() grpc.UnaryClientInterceptor { return nil }

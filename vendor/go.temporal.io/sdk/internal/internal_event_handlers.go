@@ -33,7 +33,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gogo/protobuf/proto"
 	commandpb "go.temporal.io/api/command/v1"
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
@@ -42,9 +41,10 @@ import (
 	protocolpb "go.temporal.io/api/protocol/v1"
 	taskqueuepb "go.temporal.io/api/taskqueue/v1"
 	"go.temporal.io/api/workflowservice/v1"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/durationpb"
 
 	"go.temporal.io/sdk/converter"
-	"go.temporal.io/sdk/internal/common"
 	"go.temporal.io/sdk/internal/common/metrics"
 	ilog "go.temporal.io/sdk/internal/log"
 	"go.temporal.io/sdk/internal/protocol"
@@ -170,6 +170,10 @@ type (
 		sdkVersion               string
 		sdkNameUpdated           bool
 		sdkName                  string
+		// Any update requests received in a workflow task before we have registered
+		// any handlers are not scheduled and are queued here until either their
+		// handler is registered or the event loop runs out of work and they are rejected.
+		bufferedUpdateRequests map[string][]func()
 
 		protocols *protocol.Registry
 	}
@@ -208,6 +212,8 @@ var (
 	ErrMissingMarkerDetails = errors.New("marker details are nil")
 	// ErrMissingMarkerDataKey is returned when marker details doesn't have data key.
 	ErrMissingMarkerDataKey = errors.New("marker key is missing in details")
+	// ErrUnknownHistoryEvent is returned if there is an unknown event in history and the SDK needs to handle it
+	ErrUnknownHistoryEvent = errors.New("unknown history event")
 )
 
 func newWorkflowExecutionEventHandler(
@@ -242,6 +248,7 @@ func newWorkflowExecutionEventHandler(
 		protocols:                    protocol.NewRegistry(),
 		mutableSideEffectCallCounter: make(map[string]int),
 		sdkFlags:                     newSDKFlags(capabilities),
+		bufferedUpdateRequests:       make(map[string][]func()),
 	}
 	// Attempt to skip 1 log level to remove the ReplayLogger from the stack.
 	context.logger = log.Skip(ilog.NewReplayLogger(
@@ -384,6 +391,10 @@ func (wc *workflowEnvironmentImpl) WorkflowInfo() *WorkflowInfo {
 	return wc.workflowInfo
 }
 
+func (wc *workflowEnvironmentImpl) TypedSearchAttributes() SearchAttributes {
+	return convertToTypedSearchAttributes(wc.logger, wc.workflowInfo.SearchAttributes.GetIndexedFields())
+}
+
 func (wc *workflowEnvironmentImpl) Complete(result *commonpb.Payloads, err error) {
 	wc.completeHandler(result, err)
 }
@@ -437,6 +448,23 @@ func (wc *workflowEnvironmentImpl) UpsertSearchAttributes(attributes map[string]
 	return nil
 }
 
+func (wc *workflowEnvironmentImpl) UpsertTypedSearchAttributes(attributes SearchAttributes) error {
+	rawSearchAttributes, err := serializeTypedSearchAttributes(attributes.untypedValue)
+	if err != nil {
+		return err
+	}
+
+	if _, ok := rawSearchAttributes.GetIndexedFields()[TemporalChangeVersion]; ok {
+		return errors.New("TemporalChangeVersion is a reserved key that cannot be set, please use other key")
+	}
+
+	attr := make(map[string]interface{})
+	for k, v := range rawSearchAttributes.GetIndexedFields() {
+		attr[k] = v
+	}
+	return wc.UpsertSearchAttributes(attr)
+}
+
 func (wc *workflowEnvironmentImpl) updateWorkflowInfoWithSearchAttributes(attributes *commonpb.SearchAttributes) {
 	wc.workflowInfo.SearchAttributes = mergeSearchAttributes(wc.workflowInfo.SearchAttributes, attributes)
 }
@@ -462,7 +490,7 @@ func validateAndSerializeSearchAttributes(attributes map[string]interface{}) (*c
 	if len(attributes) == 0 {
 		return nil, errSearchAttributesNotSet
 	}
-	attr, err := serializeSearchAttributes(attributes)
+	attr, err := serializeUntypedSearchAttributes(attributes)
 	if err != nil {
 		return nil, err
 	}
@@ -535,7 +563,7 @@ func (wc *workflowEnvironmentImpl) ExecuteChildWorkflow(
 		callback(nil, err)
 		return
 	}
-	searchAttr, err := serializeSearchAttributes(params.SearchAttributes)
+	searchAttr, err := serializeSearchAttributes(params.SearchAttributes, params.TypedSearchAttributes)
 	if err != nil {
 		if wc.sdkFlags.tryUse(SDKFlagChildWorkflowErrorExecution, !wc.isReplay) {
 			startedHandler(WorkflowExecution{}, &ChildWorkflowExecutionAlreadyStartedError{})
@@ -549,9 +577,9 @@ func (wc *workflowEnvironmentImpl) ExecuteChildWorkflow(
 	attributes.Namespace = params.Namespace
 	attributes.TaskQueue = &taskqueuepb.TaskQueue{Name: params.TaskQueueName, Kind: enumspb.TASK_QUEUE_KIND_NORMAL}
 	attributes.WorkflowId = params.WorkflowID
-	attributes.WorkflowExecutionTimeout = &params.WorkflowExecutionTimeout
-	attributes.WorkflowRunTimeout = &params.WorkflowRunTimeout
-	attributes.WorkflowTaskTimeout = &params.WorkflowTaskTimeout
+	attributes.WorkflowExecutionTimeout = durationpb.New(params.WorkflowExecutionTimeout)
+	attributes.WorkflowRunTimeout = durationpb.New(params.WorkflowRunTimeout)
+	attributes.WorkflowTaskTimeout = durationpb.New(params.WorkflowTaskTimeout)
 	attributes.Input = params.Input
 	attributes.WorkflowType = &commonpb.WorkflowType{Name: params.WorkflowType.Name}
 	attributes.WorkflowIdReusePolicy = params.WorkflowIDReusePolicy
@@ -563,7 +591,7 @@ func (wc *workflowEnvironmentImpl) ExecuteChildWorkflow(
 	if len(params.CronSchedule) > 0 {
 		attributes.CronSchedule = params.CronSchedule
 	}
-	attributes.UseCompatibleVersion = determineUseCompatibleFlagForCommand(
+	attributes.InheritBuildId = determineInheritBuildIdFlagForCommand(
 		params.VersioningIntent, wc.workflowInfo.TaskQueueName, params.TaskQueueName)
 
 	command, err := wc.commandsHelper.startChildWorkflowExecution(attributes)
@@ -653,17 +681,17 @@ func (wc *workflowEnvironmentImpl) ExecuteActivity(parameters ExecuteActivityPar
 	scheduleTaskAttr.ActivityType = &commonpb.ActivityType{Name: parameters.ActivityType.Name}
 	scheduleTaskAttr.TaskQueue = &taskqueuepb.TaskQueue{Name: parameters.TaskQueueName, Kind: enumspb.TASK_QUEUE_KIND_NORMAL}
 	scheduleTaskAttr.Input = parameters.Input
-	scheduleTaskAttr.ScheduleToCloseTimeout = &parameters.ScheduleToCloseTimeout
-	scheduleTaskAttr.StartToCloseTimeout = &parameters.StartToCloseTimeout
-	scheduleTaskAttr.ScheduleToStartTimeout = &parameters.ScheduleToStartTimeout
-	scheduleTaskAttr.HeartbeatTimeout = &parameters.HeartbeatTimeout
+	scheduleTaskAttr.ScheduleToCloseTimeout = durationpb.New(parameters.ScheduleToCloseTimeout)
+	scheduleTaskAttr.StartToCloseTimeout = durationpb.New(parameters.StartToCloseTimeout)
+	scheduleTaskAttr.ScheduleToStartTimeout = durationpb.New(parameters.ScheduleToStartTimeout)
+	scheduleTaskAttr.HeartbeatTimeout = durationpb.New(parameters.HeartbeatTimeout)
 	scheduleTaskAttr.RetryPolicy = parameters.RetryPolicy
 	scheduleTaskAttr.Header = parameters.Header
 	// We set this as true if not disabled on the params knowing it will be set as
 	// false just before request by the eager activity executor if eager activity
 	// execution is otherwise disallowed
 	scheduleTaskAttr.RequestEagerExecution = !parameters.DisableEagerExecution
-	scheduleTaskAttr.UseCompatibleVersion = determineUseCompatibleFlagForCommand(
+	scheduleTaskAttr.UseWorkflowBuildId = determineInheritBuildIdFlagForCommand(
 		parameters.VersioningIntent, wc.workflowInfo.TaskQueueName, parameters.TaskQueueName)
 
 	command := wc.commandsHelper.scheduleActivityTask(scheduleID, scheduleTaskAttr)
@@ -750,7 +778,7 @@ func (wc *workflowEnvironmentImpl) NewTimer(d time.Duration, callback ResultHand
 	timerID := wc.GenerateSequenceID()
 	startTimerAttr := &commandpb.StartTimerCommandAttributes{}
 	startTimerAttr.TimerId = timerID
-	startTimerAttr.StartToFireTimeout = &d
+	startTimerAttr.StartToFireTimeout = durationpb.New(d)
 
 	command := wc.commandsHelper.startTimer(startTimerAttr)
 	command.setData(&scheduledTimer{callback: callback})
@@ -776,12 +804,12 @@ func (wc *workflowEnvironmentImpl) RequestCancelTimer(timerID TimerID) {
 
 func validateVersion(changeID string, version, minSupported, maxSupported Version) {
 	if version < minSupported {
-		panic(fmt.Sprintf("Workflow code removed support of version %v. "+
+		panicIllegalState(fmt.Sprintf("[TMPRL1100] Workflow code removed support of version %v. "+
 			"for \"%v\" changeID. The oldest supported version is %v",
 			version, changeID, minSupported))
 	}
 	if version > maxSupported {
-		panic(fmt.Sprintf("Workflow code is too old to support version %v "+
+		panicIllegalState(fmt.Sprintf("[TMPRL1100] Workflow code is too old to support version %v "+
 			"for \"%v\" changeID. The maximum supported version is %v",
 			version, changeID, maxSupported))
 	}
@@ -857,7 +885,7 @@ func (wc *workflowEnvironmentImpl) SideEffect(f func() (*commonpb.Payloads, erro
 			for k := range wc.sideEffectResult {
 				keys = append(keys, k)
 			}
-			panic(fmt.Sprintf("No cached result found for side effectID=%v. KnownSideEffects=%v",
+			panicIllegalState(fmt.Sprintf("[TMPRL1100] No cached result found for side effectID=%v. KnownSideEffects=%v",
 				sideEffectID, keys))
 		}
 
@@ -879,6 +907,38 @@ func (wc *workflowEnvironmentImpl) SideEffect(f func() (*commonpb.Payloads, erro
 
 	callback(result, nil)
 	wc.logger.Debug("SideEffect Marker added", tagSideEffectID, sideEffectID)
+}
+
+func (wc *workflowEnvironmentImpl) TryUse(flag sdkFlag) bool {
+	return wc.sdkFlags.tryUse(flag, !wc.isReplay)
+}
+
+func (wc *workflowEnvironmentImpl) QueueUpdate(name string, f func()) {
+	wc.bufferedUpdateRequests[name] = append(wc.bufferedUpdateRequests[name], f)
+}
+
+func (wc *workflowEnvironmentImpl) HandleQueuedUpdates(name string) {
+	if bufferedUpdateRequests, ok := wc.bufferedUpdateRequests[name]; ok {
+		for _, request := range bufferedUpdateRequests {
+			request()
+		}
+		delete(wc.bufferedUpdateRequests, name)
+	}
+}
+
+func (wc *workflowEnvironmentImpl) DrainUnhandledUpdates() bool {
+	anyExecuted := false
+	// Check if any buffered update requests remain when we have no more coroutines to run and let them schedule so they are rejected.
+	// Generally iterating a map in workflow code is bad because it is non deterministic
+	// this case is fine since all these update handles will be rejected and not recorded in history.
+	for name, requests := range wc.bufferedUpdateRequests {
+		for _, request := range requests {
+			request()
+			anyExecuted = true
+		}
+		delete(wc.bufferedUpdateRequests, name)
+	}
+	return anyExecuted
 }
 
 // lookupMutableSideEffect gets the current value of the MutableSideEffect for id for the
@@ -937,7 +997,7 @@ func (wc *workflowEnvironmentImpl) MutableSideEffect(id string, f func() interfa
 
 	if wc.isReplay {
 		// This should not happen
-		panic(fmt.Sprintf("Non deterministic workflow code change detected. MutableSideEffect API call doesn't have a correspondent event in the workflow history. MutableSideEffect ID: %s", id))
+		panicIllegalState(fmt.Sprintf("[TMPRL1100] Non deterministic workflow code change detected. MutableSideEffect API call doesn't have a correspondent event in the workflow history. MutableSideEffect ID: %s", id))
 	}
 
 	return wc.recordMutableSideEffect(id, callCount, wc.encodeValue(f()))
@@ -1073,7 +1133,7 @@ func (weh *workflowExecutionEventHandlerImpl) ProcessEvent(
 		// No Operation
 	case enumspb.EVENT_TYPE_WORKFLOW_TASK_STARTED:
 		// Set replay clock.
-		weh.SetCurrentReplayTime(common.TimeValue(event.GetEventTime()))
+		weh.SetCurrentReplayTime(event.GetEventTime().AsTime())
 		// Update workflow info fields
 		weh.workflowInfo.currentHistoryLength = int(event.EventId)
 		weh.workflowInfo.continueAsNewSuggested = event.GetWorkflowTaskStartedEventAttributes().GetSuggestContinueAsNew()
@@ -1198,10 +1258,17 @@ func (weh *workflowExecutionEventHandlerImpl) ProcessEvent(
 		weh.handleWorkflowPropertiesModified(event)
 
 	default:
-		weh.logger.Error("unknown event type",
-			tagEventID, event.GetEventId(),
-			tagEventType, event.GetEventType().String())
-		// Do not fail to be forward compatible with new events
+		if event.WorkerMayIgnore {
+			// Do not fail to be forward compatible with new events
+			weh.logger.Debug("unknown event type",
+				tagEventID, event.GetEventId(),
+				tagEventType, event.GetEventType().String())
+		} else {
+			weh.logger.Error("unknown event type",
+				tagEventID, event.GetEventId(),
+				tagEventType, event.GetEventType().String())
+			return ErrUnknownHistoryEvent
+		}
 	}
 
 	if err != nil {
@@ -1519,7 +1586,7 @@ func (weh *workflowExecutionEventHandlerImpl) handleLocalActivityMarker(details 
 	if la, ok := weh.pendingLaTasks[lamd.ActivityID]; ok {
 		if len(lamd.ActivityType) > 0 && lamd.ActivityType != la.params.ActivityType {
 			// history marker mismatch to the current code.
-			panicMsg := fmt.Sprintf("code execute local activity %v, but history event found %v, markerData: %v", la.params.ActivityType, lamd.ActivityType, markerData)
+			panicMsg := fmt.Sprintf("[TMPRL1100] code execute local activity %v, but history event found %v, markerData: %v", la.params.ActivityType, lamd.ActivityType, markerData)
 			panicIllegalState(panicMsg)
 		}
 		weh.commandsHelper.recordLocalActivityMarker(lamd.ActivityID, details, failure)

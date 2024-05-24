@@ -86,6 +86,7 @@ type (
 		SideEffect(f func() (*commonpb.Payloads, error), callback ResultHandler)
 		GetVersion(changeID string, minSupported, maxSupported Version) Version
 		WorkflowInfo() *WorkflowInfo
+		TypedSearchAttributes() SearchAttributes
 		Complete(result *commonpb.Payloads, err error)
 		RegisterCancelHandler(handler func())
 		RequestCancelChildWorkflow(namespace, workflowID string)
@@ -122,8 +123,19 @@ type (
 		RemoveSession(sessionID string)
 		GetContextPropagators() []ContextPropagator
 		UpsertSearchAttributes(attributes map[string]interface{}) error
+		UpsertTypedSearchAttributes(attributes SearchAttributes) error
 		UpsertMemo(memoMap map[string]interface{}) error
 		GetRegistry() *registry
+		// QueueUpdate request of type name
+		QueueUpdate(name string, f func())
+		// HandleQueuedUpdates unblocks all queued updates of type name
+		HandleQueuedUpdates(name string)
+		// DrainUnhandledUpdates unblocks all updates, meant to be used to drain
+		// all unhandled updates at the end of a workflow task
+		// returns true if any update was unblocked
+		DrainUnhandledUpdates() bool
+		// TryUse returns true if this flag may currently be used.
+		TryUse(flag sdkFlag) bool
 	}
 
 	// WorkflowDefinitionFactory factory for creating WorkflowDefinition instances.
@@ -144,6 +156,7 @@ type (
 		OnWorkflowTaskStarted(deadlockDetectionTimeout time.Duration)
 		// StackTrace of all coroutines owned by the Dispatcher instance.
 		StackTrace() string
+		// Close destroys all coroutines without waiting for their completion
 		Close()
 	}
 

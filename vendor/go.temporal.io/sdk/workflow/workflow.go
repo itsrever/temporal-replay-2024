@@ -31,6 +31,8 @@ import (
 	"go.temporal.io/sdk/internal"
 	"go.temporal.io/sdk/internal/common/metrics"
 	"go.temporal.io/sdk/log"
+	"go.temporal.io/sdk/temporal"
+	"golang.org/x/exp/constraints"
 )
 
 type (
@@ -64,6 +66,9 @@ type (
 	// ContinueAsNewError can be returned by a workflow implementation function and indicates that
 	// the workflow should continue as new with the same WorkflowID, but new RunID and new history.
 	ContinueAsNewError = internal.ContinueAsNewError
+
+	// ContinueAsNewErrorOptions specifies optional attributes to be carried over to the next run.
+	ContinueAsNewErrorOptions = internal.ContinueAsNewErrorOptions
 
 	UpdateHandlerOptions = internal.UpdateHandlerOptions
 )
@@ -195,6 +200,11 @@ func ExecuteChildWorkflow(ctx Context, childWorkflow interface{}, args ...interf
 // GetInfo extracts info of a current workflow from a context.
 func GetInfo(ctx Context) *Info {
 	return internal.GetWorkflowInfo(ctx)
+}
+
+// GetTypedSearchAttributes returns a collection of the search attributes currently set for this workflow
+func GetTypedSearchAttributes(ctx Context) temporal.SearchAttributes {
+	return internal.GetTypedSearchAttributes(ctx)
 }
 
 func GetUpdateInfo(ctx Context) *UpdateInfo {
@@ -453,7 +463,7 @@ func SetUpdateHandler(ctx Context, updateName string, handler interface{}) error
 // the update handler itself is invoked and if this function returns an error,
 // the update request will be considered to have been rejected and as such will
 // not occupy any space in the workflow history. Validation functions must take
-// as inputs the same parameters as the associated update handler but my vary
+// as inputs the same parameters as the associated update handler but may vary
 // from said handler by the presence/absence of a [workflow.Context] as the first
 // parameter. Validation handlers must only return a single error. Validation
 // handlers must be deterministic and can observe workflow state but must not
@@ -542,7 +552,6 @@ func GetLastError(ctx Context) error {
 // UpsertSearchAttributes is used to add or update workflow search attributes.
 // The search attributes can be used in query of List/Scan/Count workflow APIs.
 // The key and value type must be registered on temporal server side;
-// The value has to deterministic when replay;
 // The value has to be Json serializable.
 // UpsertSearchAttributes will merge attributes to existing map in workflow, for example workflow code:
 //
@@ -570,9 +579,34 @@ func GetLastError(ctx Context) error {
 //
 // For supported operations on different server versions see [Visibility].
 //
+// Deprecated: use [UpsertTypedSearchAttributes] instead.
+//
 // [Visibility]: https://docs.temporal.io/visibility
 func UpsertSearchAttributes(ctx Context, attributes map[string]interface{}) error {
 	return internal.UpsertSearchAttributes(ctx, attributes)
+}
+
+// UpsertTypedSearchAttributes is used to add, update, or remove workflow search attributes. The search attributes can
+// be used in query of List/Scan/Count workflow APIs. The key and value type must be registered on temporal server side.
+// UpsertTypedSearchAttributes will merge attributes to existing map in workflow, for example workflow code:
+//
+//	var intKey = temporal.NewSearchAttributeKeyInt64("CustomIntField")
+//	var boolKey = temporal.NewSearchAttributeKeyBool("CustomBoolField")
+//	var keywordKey = temporal.NewSearchAttributeKeyBool("CustomKeywordField")
+//
+//	func MyWorkflow(ctx workflow.Context, input string) error {
+//		err = workflow.UpsertTypedSearchAttributes(ctx, intAttrKey.ValueSet(1), boolAttrKey.ValueSet(true))
+//		// ...
+//
+//		err = workflow.UpsertSearchAttributes(ctx, intKey.ValueSet(2), keywordKey.ValueUnset())
+//		// ...
+//	}
+//
+// For supported operations on different server versions see [Visibility].
+//
+// [Visibility]: https://docs.temporal.io/visibility
+func UpsertTypedSearchAttributes(ctx Context, searchAttributeUpdate ...temporal.SearchAttributeUpdate) error {
+	return internal.UpsertTypedSearchAttributes(ctx, searchAttributeUpdate...)
 }
 
 // UpsertMemo is used to add or update workflow memo.
@@ -621,6 +655,11 @@ func NewContinueAsNewError(ctx Context, wfn interface{}, args ...interface{}) er
 	return internal.NewContinueAsNewError(ctx, wfn, args...)
 }
 
+// NewContinueAsNewErrorWithOptions creates ContinueAsNewError instance with additional options.
+func NewContinueAsNewErrorWithOptions(ctx Context, options ContinueAsNewErrorOptions, wfn interface{}, args ...interface{}) error {
+	return internal.NewContinueAsNewErrorWithOptions(ctx, options, wfn, args...)
+}
+
 // IsContinueAsNewError return if the err is a ContinueAsNewError
 func IsContinueAsNewError(err error) bool {
 	var continueAsNewErr *ContinueAsNewError
@@ -634,4 +673,18 @@ func IsContinueAsNewError(err error) bool {
 // timeout.
 func DataConverterWithoutDeadlockDetection(c converter.DataConverter) converter.DataConverter {
 	return internal.DataConverterWithoutDeadlockDetection(c)
+}
+
+// DeterministicKeys returns the keys of a map in deterministic (sorted) order. To be used in for
+// loops in workflows for deterministic iteration.
+func DeterministicKeys[K constraints.Ordered, V any](m map[K]V) []K {
+	return internal.DeterministicKeys(m)
+}
+
+// DeterministicKeysFunc returns the keys of a map in a deterministic (sorted) order.
+// cmp(a, b) should return a negative number when a < b, a positive number when
+// a > b and zero when a == b. Keys are sorted by cmp.
+// To be used in for loops in workflows for deterministic iteration.
+func DeterministicKeysFunc[K comparable, V any](m map[K]V, cmp func(K, K) int) []K {
+	return internal.DeterministicKeysFunc(m, cmp)
 }

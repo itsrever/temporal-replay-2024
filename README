@@ -1,0 +1,13 @@
+This is a proof of concept of a status handler for workflows:
+
+To try it out:
+1. In a shell run `make start-temporal-cluster` to start a local Temporal cluster. The frontend is available at http://localhost:7233 and the UI is available at http://localhost:8233.
+2. In another shell run `make start-worker` to start the worker. For simplicity it is a worker both of worklows and activities.
+
+
+Pending application:
+1. Typed custom search attributes
+2. Improve code and examples (different workflows?)
+3. Improve README
+4. Finish repo
+5. Apply

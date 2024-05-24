@@ -1,10 +1,13 @@
-install:
+install-temporal-cli:
 	brew install temporal
 
-start:
-	./start-temporal.sh
+# Starts Temporal Cluster locally and sets up WorkflowStatus search attribute:
+# 	- Frontend: localhost:7233
+# 	- UI: localhost:8233
+start-temporal-cluster:
+	./start-temporal-cluster.sh
 
-init:
+start-worker:
 	go run ./cmd/main.go
 
 run-wf:
