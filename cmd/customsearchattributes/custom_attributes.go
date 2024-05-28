@@ -1,4 +1,4 @@
-package main
+package customsearchattributes
 
 import (
 	"go.temporal.io/sdk/temporal"

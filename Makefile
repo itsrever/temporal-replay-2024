@@ -10,8 +10,11 @@ start-temporal-cluster:
 start-worker:
 	go run ./cmd/main.go
 
-run-workflow:
+run-greet-workflow:
 	temporal workflow start --task-queue greetings --type Greet
+
+run-greet-workflow-with-output:
+	temporal workflow start --task-queue greetings --type GreetWithOutput
 
 
 # temporal workflow describe --workflow-id 15e9c0c6-48ce-42a0-a897-1f27a67cb9b0

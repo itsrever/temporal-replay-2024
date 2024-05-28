@@ -1,14 +1,11 @@
 package main
 
 import (
-	"errors"
 	"log"
-	"time"
 
+	"github.com/ericvg97/temporal-replay/cmd/workflows"
 	"go.temporal.io/sdk/client"
-	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/worker"
-	"go.temporal.io/sdk/workflow"
 )
 
 func main() {
@@ -22,9 +19,10 @@ func main() {
 
 	w := worker.New(c, "greetings", worker.Options{})
 
-	w.RegisterWorkflow(Greet)
+	w.RegisterWorkflow(workflows.Greet)
+	w.RegisterWorkflow(workflows.GreetWithOutput)
 
-	activities := &Activities{}
+	activities := &workflows.Activities{}
 	w.RegisterActivity(activities)
 
 	err = w.Run(worker.InterruptCh())
@@ -32,31 +30,3 @@ func main() {
 		log.Fatalln("Unable to start worker", err)
 	}
 }
-
-func Greet(ctx workflow.Context, name string) error {
-	ao := workflow.ActivityOptions{
-		StartToCloseTimeout: 10 * time.Second,
-		RetryPolicy: &temporal.RetryPolicy{
-			InitialInterval: time.Second,
-			MaximumAttempts: 2,
-		},
-	}
-	ctx = workflow.WithActivityOptions(ctx, ao)
-
-	ExecuteWrappedActivity(ctx, func() (Empty, error) {
-		return Empty{}, workflow.ExecuteActivity(ctx, (&Activities{}).GreetActivity).Get(ctx, nil)
-	})
-
-	SetCompleted(ctx)
-
-	return nil
-}
-
-type Activities struct{}
-
-func (a *Activities) GreetActivity() error {
-	return errors.New("failed to say greeting")
-	// return nil
-}
-
-type Empty struct{}

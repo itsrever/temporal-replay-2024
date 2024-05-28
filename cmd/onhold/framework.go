@@ -1,8 +1,9 @@
-package main
+package onhold
 
 import (
 	"encoding/json"
 
+	customeseachattributes "github.com/ericvg97/temporal-replay/cmd/customsearchattributes"
 	"go.temporal.io/sdk/workflow"
 )
 
@@ -34,9 +35,9 @@ func HandleFailure[T any](ctx workflow.Context, c func() (T, error)) T {
 }
 
 func WaitForSignals(ctx workflow.Context) (bool, string) {
-	SetOnHold(ctx)
+	customeseachattributes.SetOnHold(ctx)
 	isRetry := false
-	var skipObject string
+	skipObject := ""
 	selector := workflow.NewSelector(ctx)
 	selector.AddReceive(workflow.GetSignalChannel(ctx, "retry"), func(c workflow.ReceiveChannel, more bool) {
 		c.Receive(ctx, nil)
@@ -48,7 +49,7 @@ func WaitForSignals(ctx workflow.Context) (bool, string) {
 		isRetry = false
 	})
 	selector.Select(ctx)
-	SetRunning(ctx)
+	customeseachattributes.SetRunning(ctx)
 
 	return isRetry, skipObject
 }
