@@ -11,8 +11,6 @@ import (
 	"go.temporal.io/sdk/workflow"
 )
 
-var WorkflowStatusSearchAttribute = temporal.NewSearchAttributeKeyKeyword("WorkflowStatus")
-
 func main() {
 	c, err := client.Dial(client.Options{
 		HostPort: client.DefaultHostPort,
@@ -45,56 +43,13 @@ func Greet(ctx workflow.Context, name string) error {
 	}
 	ctx = workflow.WithActivityOptions(ctx, ao)
 
-	TryThings(ctx, func() error {
-		return workflow.ExecuteActivity(ctx, (&Activities{}).GreetActivity).Get(ctx, nil)
+	ExecuteWrappedActivity(ctx, func() (Empty, error) {
+		return Empty{}, workflow.ExecuteActivity(ctx, (&Activities{}).GreetActivity).Get(ctx, nil)
 	})
 
 	SetCompleted(ctx)
 
 	return nil
-}
-
-func TryThings(ctx workflow.Context, c func() error) {
-	err := c()
-	if err == nil {
-		return
-	}
-
-	isRetry := OnActivityFailed(ctx)
-	if isRetry {
-		TryThings(ctx, c)
-	}
-}
-
-func SetOnHold(ctx workflow.Context) {
-	_ = workflow.UpsertTypedSearchAttributes(ctx, WorkflowStatusSearchAttribute.ValueSet("ON_HOLD"))
-}
-
-func SetRunning(ctx workflow.Context) {
-	_ = workflow.UpsertTypedSearchAttributes(ctx, WorkflowStatusSearchAttribute.ValueSet("RUNNING"))
-
-}
-
-func SetCompleted(ctx workflow.Context) {
-	_ = workflow.UpsertTypedSearchAttributes(ctx, WorkflowStatusSearchAttribute.ValueSet("COMPLETED"))
-}
-
-func OnActivityFailed(ctx workflow.Context) bool {
-	SetOnHold(ctx)
-	isRetry := false
-	selector := workflow.NewSelector(ctx)
-	selector.AddReceive(workflow.GetSignalChannel(ctx, "retry"), func(c workflow.ReceiveChannel, more bool) {
-		c.Receive(ctx, nil)
-		isRetry = true
-	})
-	selector.AddReceive(workflow.GetSignalChannel(ctx, "skip"), func(c workflow.ReceiveChannel, more bool) {
-		c.Receive(ctx, nil)
-		isRetry = false
-	})
-	selector.Select(ctx)
-	SetRunning(ctx)
-
-	return isRetry
 }
 
 type Activities struct{}
@@ -103,3 +58,5 @@ func (a *Activities) GreetActivity() error {
 	return errors.New("failed to say greeting")
 	// return nil
 }
+
+type Empty struct{}
