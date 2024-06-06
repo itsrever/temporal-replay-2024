@@ -10,8 +10,6 @@ import (
 	"go.temporal.io/sdk/workflow"
 )
 
-// "{\n   \"greeting\":\"Hey you!\"\n}"
-
 func GreetWithOutput(ctx workflow.Context, name string) (string, error) {
 	ao := workflow.ActivityOptions{
 		StartToCloseTimeout: 10 * time.Second,

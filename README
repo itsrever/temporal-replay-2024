@@ -1,26 +1,23 @@
 This is a proof of concept of a status handler for workflows:
 
-To try it out:
-0. Install Temporal cli. Run `make install-temporal-cli`
-1. Open a shell and start the Temporal cluster by running: `make start-temporal-cluster`. The frontend is available at http://localhost:7233 and the UI at http://localhost:8233.
-2. In a new shell run `make start-worker` to start the worker. For simplicity it is a worker both of worklows and activities.
-3. In a new shell start a workflow by running `make run-workflow`
-4. Access the UI at http://localhost:8233. You should see the workflow running and if you access it, you will see that the GreetingActivity failed.
-5. Try to send a signal called `retry` (without a body) and see the GreetingActivity runs again (and fails again)
-6. Try to send a signal called `skip` (without a body) and see the workflow completes successfully (not running the GreetingActivity again)
-7. Start a new workflow in the shell
-8. Check the GreetingActivity has failed again
-9. Go to the activity implementation and make it not return nil (no error)
-10. Kill the worker (CTRL+C) and start it again
-11. Send a `retry` signal to the workflow
-12. See that the WF has run the GreetingActivity again (this time successfully) and it has completed.
+Set up:
+1. Install Temporal cli. Run `make install-temporal-cli`
+2. Open a shell and start the Temporal cluster by running: `make start-temporal-cluster`. \
+The frontend is available at http://localhost:7233 and the UI at http://localhost:8233.
 
+Retry example:
+1. In a new shell run `make start-worker` to start the worker (activity and workflows)
+2. In a new shell start a workflow by running `make run-greet-workflow`
+3. Access the UI at http://localhost:8233. You should see the workflow running and if you access it, you will see that the GreetingActivity failed.
+4. Send a signal called `retry` (without a body) and see the GreetingActivity runs again (and fails again)
+5. Go to the activity implementation and make it return nil (no error)
+6. Kill the worker (CTRL+C) and start it again
+7. Send a `retry` signal to the workflow
+8. See that the WF has run the GreetingActivity again (this time successfully) and it has completed.
 
-Pending application:
-1. [DONE] Typed custom search attributes
-2. Improve code and examples
-3. Improve README
-4. Instructions to install
-5. Video tutorial + instructions on how to set the ON_HOLD visualization
-4. Finish repo
-5. Apply
+Manually-executed example:
+1. In a new shell run `make start-worker` to start the worker
+2. In a new shell start a workflow by running `make run-greet-workflow-with-output`
+3. Access the UI. You should see the workflow running and if you access it, you will see that the GreetActivityWithOutput failed.
+4. Send a signal called `manually-executed` with body `"{\n   \"greeting\":\"Hey you!\"\n}"`
+5. See that the WF has completed and that the output is `"Hey you!"`

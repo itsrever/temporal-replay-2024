@@ -17,17 +17,17 @@ func ExecuteWrappedActivity[T any](ctx workflow.Context, c func() (T, error)) T 
 }
 
 func HandleFailure[T any](ctx workflow.Context, c func() (T, error)) T {
-	isRetry, skipObject := WaitForSignals(ctx)
+	isRetry, manuallyExecutedObject := WaitForSignals(ctx)
 	if isRetry {
 		ExecuteWrappedActivity(ctx, c)
 	}
 
 	var zeroValue T
-	if skipObject == "" {
+	if manuallyExecutedObject == "" {
 		return zeroValue
 	}
 
-	err := json.Unmarshal([]byte(skipObject), &zeroValue)
+	err := json.Unmarshal([]byte(manuallyExecutedObject), &zeroValue)
 	if err != nil {
 		return HandleFailure[T](ctx, c)
 	}
@@ -37,19 +37,19 @@ func HandleFailure[T any](ctx workflow.Context, c func() (T, error)) T {
 func WaitForSignals(ctx workflow.Context) (bool, string) {
 	customeseachattributes.SetOnHold(ctx)
 	isRetry := false
-	skipObject := ""
+	manuallyExecutedObject := ""
 	selector := workflow.NewSelector(ctx)
 	selector.AddReceive(workflow.GetSignalChannel(ctx, "retry"), func(c workflow.ReceiveChannel, more bool) {
 		c.Receive(ctx, nil)
 		isRetry = true
 	})
-	selector.AddReceive(workflow.GetSignalChannel(ctx, "skip"), func(c workflow.ReceiveChannel, more bool) {
-		c.Receive(ctx, &skipObject)
+	selector.AddReceive(workflow.GetSignalChannel(ctx, "manually-executed"), func(c workflow.ReceiveChannel, more bool) {
+		c.Receive(ctx, &manuallyExecutedObject)
 
 		isRetry = false
 	})
 	selector.Select(ctx)
 	customeseachattributes.SetRunning(ctx)
 
-	return isRetry, skipObject
+	return isRetry, manuallyExecutedObject
 }
