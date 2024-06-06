@@ -2,7 +2,6 @@ package workflows
 
 import (
 	"errors"
-	"fmt"
 	"time"
 
 	"github.com/ericvg97/temporal-replay/cmd/customsearchattributes"
@@ -13,7 +12,7 @@ import (
 
 // "{\n   \"greeting\":\"Hey you!\"\n}"
 
-func GreetWithOutput(ctx workflow.Context, name string) error {
+func GreetWithOutput(ctx workflow.Context, name string) (string, error) {
 	ao := workflow.ActivityOptions{
 		StartToCloseTimeout: 10 * time.Second,
 		RetryPolicy: &temporal.RetryPolicy{
@@ -29,15 +28,21 @@ func GreetWithOutput(ctx workflow.Context, name string) error {
 		return output, err
 	})
 
-	fmt.Printf("This is the greeting: %v \n", output.Greeting)
-
 	customsearchattributes.SetCompleted(ctx)
 
-	return nil
+	return output.GetGreeting(), nil
 }
 
 type Output struct {
 	Greeting string `json:"greeting"`
+}
+
+func (o *Output) GetGreeting() string {
+	if o == nil {
+		return ""
+	}
+
+	return o.Greeting
 }
 
 func (a *Activities) GreetActivityWithOutput() (Output, error) {
