@@ -19,5 +19,5 @@ Manually-executed example:
 1. In a new shell run `make start-worker` to start the worker
 2. In a new shell start a workflow by running `make run-greet-workflow-with-output`
 3. Access the UI. You should see the workflow running and if you access it, you will see that the GreetActivityWithOutput failed.
-4. Send a signal called `manually-executed` with body `"{\n   \"greeting\":\"Hey you!\"\n}"`
+4. Send a signal called `manually-executed` with body `"{\n   \"greeting\":\"Hi there Temporal Replay!\"\n}"`
 5. See that the WF has completed and that the output is `"Hey you!"`
