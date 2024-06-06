@@ -1,2 +1,0 @@
-1. How do you handle multithreading with multiple failures?
-    Probably Status can be common (has at least one on hold? Then we need an identifier to send the signal but this won't work I think)
